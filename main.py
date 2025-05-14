@@ -1,5 +1,8 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from pydantic import BaseModel
+import pandas as pd
+import io
+import csv
 import uvicorn
 import os
 import xgboost as xgb
@@ -17,7 +20,10 @@ model.load_model('xgboost_model.json')
 
 # Define the label encoder for the categorical variables
 label_encoder = LabelEncoder()
-label_encoder.fit(['rent', 'own', 'mortgage'])  # Fit the encoder to these categories
+label_encoder.fit(['rent', 'own', 'mortgage','other'])  # Fit the encoder to these categories
+
+previous_loan_defaults_encoder = LabelEncoder()
+previous_loan_defaults_encoder.fit(['yes', 'no'])  # Fit the encoder to these categories
 
 @app.get("/")
 def read_root():
@@ -30,47 +36,62 @@ class LoanApplication(BaseModel):
     age: int
     previous_loan_defaults_on_file: float
     person_home_ownership: str  # Categorical feature: rent, own, mortgage
-
-@app.post("/predict")
-def predict(data: LoanApplication):
-    # Normalize and clean the person_home_ownership string (strip whitespace and lowercase)
-    home_ownership = data.person_home_ownership.strip().lower()
     
-    # Check if the input string is valid
-    if home_ownership not in label_encoder.classes_:
-        raise HTTPException(status_code=400, detail=f"Invalid home ownership type: '{home_ownership}'. Valid types are 'rent', 'own', 'mortgage'.")
-    
-    # Label encode the person_home_ownership
-    person_home_ownership_encoded = label_encoder.transform([home_ownership])[0]
+@app.post("/predict/csv")
+async def predict_csv(file: UploadFile = File(...)):
+    contents = await file.read()
+    csv_file = io.StringIO(contents.decode('utf-8'))
+    df = pd.read_csv(csv_file)
 
-    # Calculate the necessary ratios
-    debt_to_income_ratio = data.loan_amount / data.income if data.income > 0 else 0
-    loan_percent_income = (data.loan_amount / data.income) * 100  # Percentage
-    age_income_ratio = data.age / data.income if data.income > 0 else 0
-    
-    # Construct the input array with calculated ratios and encoded feature
-    input_data = np.array([[
-        data.previous_loan_defaults_on_file, 
-        debt_to_income_ratio, 
-        loan_percent_income, 
-        data.credit_score,  # Assuming credit score directly used
-        age_income_ratio, 
-        person_home_ownership_encoded  # Encoded categorical feature
-    ]])
+    # Lowercase และ strip ค่า categorical ล่วงหน้า
+    df['person_home_ownership'] = df['person_home_ownership'].str.strip().str.lower()
+    df['previous_loan_defaults_on_file'] = df['previous_loan_defaults_on_file'].str.strip().str.lower()
 
-    # Get the probabilities for each class (0 = Declined, 1 = Approved)
-    proba = model.predict_proba(input_data)[0]
+    # ตรวจสอบค่า invalid
+    invalid_home_ownership = ~df['person_home_ownership'].isin(label_encoder.classes_)
+    if invalid_home_ownership.any():
+        raise HTTPException(status_code=400, detail=f"Invalid home ownership types: {df['person_home_ownership'][invalid_home_ownership].unique().tolist()}")
 
-    # Get the probability of approval (class 1) and convert it to percentage
-    approval_probability = float(proba[1]) * 100  # Explicitly convert to float
+    invalid_defaults = ~df['previous_loan_defaults_on_file'].isin(previous_loan_defaults_encoder.classes_)
+    if invalid_defaults.any():
+        raise HTTPException(status_code=400, detail=f"Invalid previous loan default types: {df['previous_loan_defaults_on_file'][invalid_defaults].unique().tolist()}")
 
-    # Make the prediction (class with the higher probability)
-    prediction = model.predict(input_data)
+    # แปลงเป็นตัวเลขด้วย LabelEncoder
+    df['person_home_ownership_encoded'] = label_encoder.transform(df['person_home_ownership'])
+    df['previous_loan_defaults_encoded'] = previous_loan_defaults_encoder.transform(df['previous_loan_defaults_on_file'])
 
-    # Based on the prediction, return the result
-    result = "Approved" if prediction[0] == 1 else "Declined"
-    
+    # คำนวณฟีเจอร์ใหม่แบบเวกเตอร์
+    df['debt_to_income_ratio'] = df['loan_amnt'] / df['person_income']
+    df['loan_percent_income'] = (df['loan_amnt'] / df['person_income']) * 100
+    df['age_income_ratio'] = df['person_age'] / df['person_income']
+
+    # เตรียมข้อมูล input สำหรับโมเดล
+    input_data = df[[
+        'previous_loan_defaults_encoded',
+        'debt_to_income_ratio',
+        'loan_percent_income',
+        'credit_score',
+        'age_income_ratio',
+        'person_home_ownership_encoded'
+    ]].astype(np.float32).values
+
+    # ทำนายผลลัพธ์
+    proba = model.predict_proba(input_data)
+    preds = model.predict(input_data)
+
+    # สร้างผลลัพธ์
+    df['result'] = np.where(preds == 1, 'Approved', 'Declined')
+    df['approval_probability'] = np.round(proba[:, 1] * 100, 2)
+
+    # เลือกคอลัมน์ที่จะส่งกลับ
     return {
-        "result": result,
-        "approval_probability": round(approval_probability, 2)  # Showing the percentage with two decimals
+        "results": df[[
+            'person_age', 'person_income', 'loan_amnt', 'credit_score',
+            'previous_loan_defaults_on_file', 'person_home_ownership',
+            'result', 'approval_probability'
+        ]].rename(columns={
+            'person_age': 'age',
+            'person_income': 'income',
+            'loan_amnt': 'loan_amount'
+        }).to_dict(orient="records")
     }
