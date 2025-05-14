@@ -8,7 +8,6 @@ import numpy as np
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
 import uvicorn
-import os
 from functools import lru_cache
 
 # Create an instance of FastAPI
@@ -59,7 +58,7 @@ COLUMN_MAPPING = {
 class LoanApplication(BaseModel):
     income: float = Field(..., gt=0, description="Annual income")
     loan_amount: float = Field(..., gt=0, description="Requested loan amount")
-    loan_int_rate: float = Field(..., ge=5, le=20, description="Credit score (300-850)")
+    loan_int_rate: float = Field(..., ge=5, le=20, description="Loan Interest Rate (5-20%)")
     age: int = Field(..., ge=18, le=120, description="Applicant age")
     previous_defaults: str = Field(..., description="Previous loan defaults on file (yes/no)")
     home_ownership: str = Field(..., description="Home ownership status (rent/own/mortgage/other)")
@@ -90,9 +89,17 @@ def read_root():
 
 def process_loan_data(df: pd.DataFrame, model):
     """Process loan data and make predictions - extracted common functionality"""
-    # Standardize column names
+    # Standardize column names (ensure all columns are properly mapped)
     df = df.rename(columns={old: new for old, new in COLUMN_MAPPING.items() if old in df.columns})
     
+    # Ensure that all necessary columns are present
+    required_columns = ['previous_defaults', 'loan_amount', 'loan_int_rate', 'age', 'income', 'home_ownership']
+    
+    # Check if all required columns are present
+    missing_cols = [col for col in required_columns if col not in df.columns]
+    if missing_cols:
+        raise HTTPException(status_code=400, detail=f"Missing required columns: {', '.join(missing_cols)}")
+
     # Clean categorical columns (vectorized operation)
     df['home_ownership'] = df['home_ownership'].str.strip().str.lower()
     df['previous_defaults'] = df['previous_defaults'].str.strip().str.lower()
@@ -119,13 +126,14 @@ def process_loan_data(df: pd.DataFrame, model):
     df['age_income_ratio'] = df['age'] / df['income']
     
     # Prepare model input features
+    # Ensure all 6 columns are passed to the model
     features = df[[
         'previous_defaults_encoded',
         'debt_to_income_ratio',
-        'loan_percent_income',
         'loan_int_rate',
         'age_income_ratio',
-        'home_ownership_encoded'
+        'home_ownership_encoded',
+        'loan_amount'  # Add this feature to match model's expected input shape
     ]].values.astype(np.float32)
 
     # Predict
@@ -134,6 +142,7 @@ def process_loan_data(df: pd.DataFrame, model):
     df['approval_probability'] = np.round(probabilities[:, 1] * 100, 2)
     
     return df
+
 
 @app.post("/predict/csv")
 async def predict_csv(
@@ -169,34 +178,7 @@ async def predict_csv(
             results.append(chunk_result)
         
         # Combine all chunks
-        if results:
-            combined_results = pd.concat(results)
-            
-            # Calculate pagination info
-            total_items = len(combined_results)
-            total_pages = (total_items + page_size - 1) // page_size
-            
-            # Ensure page is within valid range
-            if page > total_pages and total_pages > 0:
-                page = total_pages
-            
-            # Calculate offsets
-            start_idx = (page - 1) * page_size
-            end_idx = min(start_idx + page_size, total_items)
-            
-            # Get page data
-            page_data = combined_results.iloc[start_idx:end_idx]
-            
-            return {
-                "results": page_data.to_dict(orient="records"),
-                "pagination": {
-                    "page": page,
-                    "page_size": page_size,
-                    "total_items": total_items,
-                    "total_pages": total_pages
-                }
-            }
-        else:
+        if not results:
             return {
                 "results": [],
                 "pagination": {
@@ -206,7 +188,31 @@ async def predict_csv(
                     "total_pages": 0
                 }
             }
-            
+
+        combined_results = pd.concat(results, ignore_index=True)
+
+        total_items = len(combined_results)
+        total_pages = (total_items + page_size - 1) // page_size
+
+        # Clamp page value
+        page = min(page, total_pages) if total_pages > 0 else 1
+
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+
+        # Use direct slicing instead of iloc when index is simple range
+        page_data = combined_results[start_idx:end_idx]
+
+        return {
+            "results": page_data.to_dict(orient="records"),
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_items": total_items,
+                "total_pages": total_pages
+            }
+        }
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
@@ -242,7 +248,8 @@ async def analyze_csv(
                 df['result'],
                 normalize='index'
             ).round(4).to_dict(orient="index"),
-                    # Approval rate by previous loan defaults
+            
+            # Approval rate by previous loan defaults
             "approval_by_defaults": pd.crosstab(
                 df['previous_defaults'],
                 df['result'],
