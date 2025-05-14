@@ -1,8 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import uvicorn
+import os
 import xgboost as xgb
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=os.getenv("PORT", default=8080), log_level="info")
 
 app = FastAPI()
 
